@@ -1,13 +1,31 @@
-# Claude HUD Enhanced
+# Claude HUD Enhanced (with Proxy Support)
 
-An enhanced Claude Code plugin that shows what's happening — context usage, active tools, running agents, todo progress, **and detailed usage limits with time-to-reset countdowns**. Always visible below your input.
+A fork of [alwinpaul1/claude-hud-enhanced](https://github.com/alwinpaul1/claude-hud-enhanced) with **HTTP/HTTPS proxy support** for the usage API. Shows context usage, active tools, running agents, todo progress, and detailed usage limits with time-to-reset countdowns. Always visible below your input.
 
 [![License](https://img.shields.io/github/license/alwinpaul1/claude-hud-enhanced?v=2)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/alwinpaul1/claude-hud-enhanced)](https://github.com/alwinpaul1/claude-hud-enhanced/stargazers)
 
 ![Claude HUD in action](claude-hud-preview-5-2.png)
 
-## Install
+## Install (This Fork)
+
+One-command install — works on Linux, macOS, and Windows (Git Bash):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/AnFuran/claude-hud-enhanced/main/install.sh)
+```
+
+This will clone the repo, install dependencies, build, and configure `statusLine` automatically. Restart Claude Code after install.
+
+### Proxy Support
+
+The usage API requests will auto-detect your proxy from:
+
+1. Environment variables: `HTTP_PROXY` / `HTTPS_PROXY`
+2. `~/.claude.json` `env` field (Claude Code's own config)
+
+No extra configuration needed — if your Claude Code already uses a proxy, the HUD will use it too.
+
+### Install from Original (without proxy support)
 
 Inside a Claude Code instance, run the following commands:
 

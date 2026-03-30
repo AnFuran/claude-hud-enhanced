@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as http from 'http';
 import * as https from 'https';
+import * as tls from 'tls';
 import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 import { createDebug } from './debug.js';
@@ -428,6 +429,18 @@ function handleApiResponse(resolve) {
         });
     };
 }
+/** Parse HTTP chunked transfer encoding body */
+function parseChunkedBody(body) {
+    const lines = body.split('\r\n');
+    let result = '';
+    for (let i = 0; i < lines.length; i += 2) {
+        const size = parseInt(lines[i], 16);
+        if (isNaN(size) || size === 0)
+            break;
+        result += lines[i + 1] ?? '';
+    }
+    return result || body;
+}
 /** Fetch from the original Anthropic OAuth usage endpoint */
 function fetchUsageApi(accessToken, organizationUuid) {
     return new Promise((resolve) => {
@@ -459,18 +472,44 @@ function fetchUsageApi(accessToken, organizationUuid) {
                     resolve(null);
                     return;
                 }
-                const req = https.request({
-                    hostname: targetHost,
-                    path: targetPath,
-                    method: 'GET',
-                    headers,
-                    agent: false,
-                    timeout: 5000,
-                    createConnection: () => socket,
-                }, handleApiResponse(resolve));
-                req.on('error', (error) => { debug('API error via proxy:', error); resolve(null); });
-                req.on('timeout', () => { debug('API timeout via proxy'); req.destroy(); resolve(null); });
-                req.end();
+                // Manually wrap with TLS over the CONNECT tunnel socket
+                const tlsSocket = tls.connect({
+                    socket: socket,
+                    servername: targetHost,
+                }, () => {
+                    debug('TLS connected via proxy, authorized:', tlsSocket.authorized);
+                    // Build raw HTTP request — Node's http/https modules don't reliably
+                    // handle pre-established TLS sockets via createConnection
+                    const headerLines = Object.entries(headers)
+                        .map(([k, v]) => `${k}: ${v}`)
+                        .join('\r\n');
+                    const rawReq = `GET ${targetPath} HTTP/1.1\r\nHost: ${targetHost}\r\n${headerLines}\r\nConnection: close\r\n\r\n`;
+                    tlsSocket.write(rawReq);
+                    let data = '';
+                    tlsSocket.on('data', (chunk) => { data += chunk.toString(); });
+                    tlsSocket.on('end', () => {
+                        const parts = data.split('\r\n\r\n');
+                        const statusLine = parts[0]?.split('\r\n')[0] ?? '';
+                        const statusCode = parseInt(statusLine.split(' ')[1] ?? '0', 10);
+                        const body = parts.slice(1).join('\r\n\r\n');
+                        if (statusCode !== 200) {
+                            debug('API returned non-200 via proxy:', statusCode);
+                            resolve(null);
+                            return;
+                        }
+                        try {
+                            // Handle chunked transfer encoding
+                            const parsed = JSON.parse(body.includes('\r\n') ? parseChunkedBody(body) : body);
+                            debug('API response via proxy:', parsed);
+                            resolve(parsed);
+                        }
+                        catch (error) {
+                            debug('Failed to parse API response via proxy:', error);
+                            resolve(null);
+                        }
+                    });
+                });
+                tlsSocket.on('error', (error) => { debug('TLS error via proxy:', error); resolve(null); });
             });
             proxyReq.on('error', (error) => { debug('Proxy request error:', error); resolve(null); });
             proxyReq.on('timeout', () => { debug('Proxy connect timeout'); proxyReq.destroy(); resolve(null); });

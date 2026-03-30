@@ -483,10 +483,27 @@ function parseDate(dateStr: string | undefined): Date | null {
   return date;
 }
 
-/** Detect HTTP proxy from environment variables */
+/** Read proxy from ~/.claude.json env field (Claude Code's own config) */
+function getProxyFromClaudeConfig(): string | null {
+  try {
+    const claudeJsonPath = path.join(os.homedir(), '.claude.json');
+    if (!fs.existsSync(claudeJsonPath)) return null;
+    const content = fs.readFileSync(claudeJsonPath, 'utf8');
+    const config = JSON.parse(content);
+    const env = config?.env;
+    if (!env || typeof env !== 'object') return null;
+    return env.HTTPS_PROXY || env.https_proxy
+      || env.HTTP_PROXY || env.http_proxy || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Detect HTTP proxy from environment variables and ~/.claude.json */
 function getHttpProxy(): { hostname: string; port: number } | null {
   const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY
-    || process.env.http_proxy || process.env.HTTP_PROXY;
+    || process.env.http_proxy || process.env.HTTP_PROXY
+    || getProxyFromClaudeConfig();
   if (!proxyUrl) return null;
   try {
     const parsed = new URL(proxyUrl);

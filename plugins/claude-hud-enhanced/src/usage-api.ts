@@ -1,7 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import * as https from 'https';
+import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 import type { UsageData, ModelQuota, MaxPlanInfo, CompactionInfo } from './types.js';
 import { createDebug } from './debug.js';
@@ -481,6 +483,44 @@ function parseDate(dateStr: string | undefined): Date | null {
   return date;
 }
 
+/** Detect HTTP proxy from environment variables */
+function getHttpProxy(): { hostname: string; port: number } | null {
+  const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY
+    || process.env.http_proxy || process.env.HTTP_PROXY;
+  if (!proxyUrl) return null;
+  try {
+    const parsed = new URL(proxyUrl);
+    return { hostname: parsed.hostname, port: parseInt(parsed.port, 10) || 1080 };
+  } catch {
+    return null;
+  }
+}
+
+/** Handle API response (shared between direct and proxied paths) */
+function handleApiResponse(resolve: (value: UsageApiResponse | null) => void): (res: http.IncomingMessage) => void {
+  return (res) => {
+    let data = '';
+    res.on('data', (chunk: Buffer) => {
+      data += chunk.toString();
+    });
+    res.on('end', () => {
+      if (res.statusCode !== 200) {
+        debug('Anthropic API returned non-200 status:', res.statusCode);
+        resolve(null);
+        return;
+      }
+      try {
+        const parsed: UsageApiResponse = JSON.parse(data);
+        debug('Anthropic API response:', parsed);
+        resolve(parsed);
+      } catch (error) {
+        debug('Failed to parse Anthropic API response:', error);
+        resolve(null);
+      }
+    });
+  };
+}
+
 /** Fetch from the original Anthropic OAuth usage endpoint */
 function fetchUsageApi(accessToken: string, organizationUuid?: string): Promise<UsageApiResponse | null> {
   return new Promise((resolve) => {
@@ -490,55 +530,70 @@ function fetchUsageApi(accessToken: string, organizationUuid?: string): Promise<
       'anthropic-beta': 'oauth-2025-04-20',
       'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
     };
-    
+
     if (organizationUuid) {
       headers['x-organization-uuid'] = organizationUuid;
     }
 
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/api/oauth/usage',
-      method: 'GET',
-      headers,
-      timeout: 5000,
-    };
+    const targetHost = 'api.anthropic.com';
+    const targetPath = '/api/oauth/usage';
+    const proxy = getHttpProxy();
 
-    const req = https.request(options, (res) => {
-      let data = '';
-
-      res.on('data', (chunk: Buffer) => {
-        data += chunk.toString();
+    if (proxy) {
+      debug('Using proxy:', proxy.hostname, proxy.port);
+      const proxyReq = http.request({
+        hostname: proxy.hostname,
+        port: proxy.port,
+        method: 'CONNECT',
+        path: `${targetHost}:443`,
+        timeout: 5000,
       });
 
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          debug('Anthropic API returned non-200 status:', res.statusCode);
+      proxyReq.on('connect', (proxyRes, socket) => {
+        if (proxyRes.statusCode !== 200) {
+          debug('Proxy CONNECT failed:', proxyRes.statusCode);
+          socket.destroy();
           resolve(null);
           return;
         }
-
-        try {
-          const parsed: UsageApiResponse = JSON.parse(data);
-          debug('Anthropic API response:', parsed);
-          resolve(parsed);
-        } catch (error) {
-          debug('Failed to parse Anthropic API response:', error);
-          resolve(null);
-        }
+        const req = https.request({
+          hostname: targetHost,
+          path: targetPath,
+          method: 'GET',
+          headers,
+          agent: false,
+          timeout: 5000,
+          createConnection: () => socket,
+        } as https.RequestOptions, handleApiResponse(resolve));
+        req.on('error', (error) => { debug('API error via proxy:', error); resolve(null); });
+        req.on('timeout', () => { debug('API timeout via proxy'); req.destroy(); resolve(null); });
+        req.end();
       });
-    });
 
-    req.on('error', (error) => {
-      debug('Anthropic API request error:', error);
-      resolve(null);
-    });
-    req.on('timeout', () => {
-      debug('Anthropic API request timeout');
-      req.destroy();
-      resolve(null);
-    });
+      proxyReq.on('error', (error) => { debug('Proxy request error:', error); resolve(null); });
+      proxyReq.on('timeout', () => { debug('Proxy connect timeout'); proxyReq.destroy(); resolve(null); });
+      proxyReq.end();
+    } else {
+      const req = https.request({
+        hostname: targetHost,
+        path: targetPath,
+        method: 'GET',
+        headers,
+        timeout: 5000,
+      }, handleApiResponse(resolve));
 
-    req.end();
+      req.on('error', (error) => {
+        debug('Anthropic API request error:', error);
+        resolve(null);
+      });
+      req.on('timeout', () => {
+        debug('Anthropic API request timeout');
+        req.destroy();
+        resolve(null);
+      });
+
+      req.end();
+    }
   });
 }
 

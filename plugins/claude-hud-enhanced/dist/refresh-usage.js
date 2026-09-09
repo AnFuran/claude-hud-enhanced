@@ -1,8 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
+import * as https from 'node:https';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as tls from 'node:tls';
 import { pathToFileURL } from 'node:url';
 import { getClaudeConfigDir } from './claude-config-dir.js';
 import { BACKOFF_AUTH_MS, BACKOFF_ERROR_MS, BACKOFF_RATE_LIMIT_MS, shouldRefresh, } from './usage-hybrid.js';
@@ -19,6 +22,12 @@ import { getClaudeCodeVersion } from './version.js';
  * shape ported from sirmalloc/ccstatusline (src/utils/usage-fetch.ts).
  */
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+/**
+ * Proxy for the usage call when no HTTPS_PROXY/HTTP_PROXY is set. Node's global
+ * fetch ignores those variables, so the refresher tunnels through the proxy by
+ * hand (see getViaProxy); set NO_PROXY=api.anthropic.com to go direct instead.
+ */
+const DEFAULT_PROXY_URL = 'http://127.0.0.1:7890';
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 const FETCH_TIMEOUT_MS = 5_000;
 const WATCHDOG_MS = 15_000;
@@ -159,18 +168,128 @@ export function failureSnapshot(prev, status, now, retryAfterMs = null) {
         next_attempt_at: new Date(now + backoffMs).toISOString(),
     };
 }
+function firstNonEmpty(...values) {
+    return values.find((v) => typeof v === 'string' && v.trim().length > 0)?.trim();
+}
+/** Standard NO_PROXY semantics: `*`, an exact host, or a domain suffix (`.example.com` / `example.com`). */
+function noProxyMatches(noProxy, host) {
+    if (!noProxy)
+        return false;
+    const target = host.toLowerCase();
+    return noProxy
+        .split(',')
+        .map((entry) => entry.trim().toLowerCase())
+        .filter((entry) => entry.length > 0)
+        .some((entry) => {
+        if (entry === '*')
+            return true;
+        const suffix = entry.startsWith('.') ? entry : `.${entry}`;
+        return target === entry || target.endsWith(suffix);
+    });
+}
+/**
+ * Proxy to tunnel the usage call through: HTTPS_PROXY > https_proxy > HTTP_PROXY
+ * > http_proxy, else DEFAULT_PROXY_URL. Null means "connect directly" — the host
+ * is covered by NO_PROXY, or the configured value is not an http(s) URL.
+ */
+export function resolveProxyUrl(host, env = process.env) {
+    if (noProxyMatches(firstNonEmpty(env.NO_PROXY, env.no_proxy), host))
+        return null;
+    const raw = firstNonEmpty(env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy) ?? DEFAULT_PROXY_URL;
+    try {
+        const url = new URL(raw);
+        return url.protocol === 'http:' || url.protocol === 'https:' ? url : null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * GET `url` through an HTTP CONNECT tunnel on `proxy` with node:http + node:tls —
+ * no undici dependency, works on every supported Node. Rejects on proxy, TLS, or
+ * network failure and after `timeoutMs` of socket inactivity.
+ */
+function getViaProxy(url, proxy, headers, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const targetPort = Number(url.port) || 443;
+        const target = `${url.hostname}:${targetPort}`;
+        const proxyHeaders = { Host: target };
+        if (proxy.username) {
+            const credentials = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
+            proxyHeaders['Proxy-Authorization'] = `Basic ${Buffer.from(credentials).toString('base64')}`;
+        }
+        const connectVia = proxy.protocol === 'https:' ? https.request : http.request;
+        const connect = connectVia({
+            host: proxy.hostname.replace(/^\[|\]$/g, ''),
+            port: Number(proxy.port) || (proxy.protocol === 'https:' ? 443 : 80),
+            method: 'CONNECT',
+            path: target,
+            headers: proxyHeaders,
+            timeout: timeoutMs,
+        });
+        connect.once('timeout', () => connect.destroy(new Error('proxy CONNECT timed out')));
+        connect.once('error', reject);
+        connect.once('connect', (connectRes, socket, head) => {
+            if (connectRes.statusCode !== 200) {
+                socket.destroy();
+                reject(new Error(`proxy CONNECT failed: ${connectRes.statusCode}`));
+                return;
+            }
+            if (head.length > 0)
+                socket.unshift(head);
+            const req = https.request({
+                host: url.hostname,
+                port: targetPort,
+                method: 'GET',
+                path: `${url.pathname}${url.search}`,
+                headers,
+                timeout: timeoutMs,
+                // Run TLS over the tunnel socket; SNI and the certificate check still
+                // target the real host, so the proxy cannot impersonate it.
+                createConnection: () => tls.connect({ socket, host: url.hostname, servername: url.hostname }),
+            }, (res) => {
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.once('error', reject);
+                res.once('end', () => {
+                    const retryAfter = res.headers['retry-after'];
+                    resolve({
+                        status: res.statusCode ?? 0,
+                        retryAfter: typeof retryAfter === 'string' ? retryAfter : null,
+                        body: Buffer.concat(chunks).toString('utf8'),
+                    });
+                });
+            });
+            req.once('timeout', () => req.destroy(new Error('usage request timed out')));
+            req.once('error', reject);
+            req.end();
+        });
+        connect.end();
+    });
+}
+/** Direct path (host excluded by NO_PROXY): plain fetch, as before. */
+async function getDirect(url, headers, timeoutMs) {
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    return {
+        status: res.status,
+        retryAfter: res.headers.get('retry-after'),
+        body: await res.text().catch(() => ''),
+    };
+}
 async function fetchUsage(token, userAgent, now) {
+    const url = new URL(USAGE_URL);
+    const headers = {
+        Authorization: `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        Accept: 'application/json',
+        'User-Agent': userAgent,
+    };
     let res;
     try {
-        res = await fetch(USAGE_URL, {
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'anthropic-beta': 'oauth-2025-04-20',
-                Accept: 'application/json',
-                'User-Agent': userAgent,
-            },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
+        const proxy = resolveProxyUrl(url.hostname);
+        res = proxy
+            ? await getViaProxy(url, proxy, headers, FETCH_TIMEOUT_MS)
+            : await getDirect(url, headers, FETCH_TIMEOUT_MS);
     }
     catch {
         return { kind: 'error' };
@@ -178,12 +297,11 @@ async function fetchUsage(token, userAgent, now) {
     if (res.status === 401 || res.status === 403)
         return { kind: 'auth_expired' };
     if (res.status === 429) {
-        return { kind: 'rate_limited', retryAfterMs: parseRetryAfterMs(res.headers.get('retry-after'), now) };
+        return { kind: 'rate_limited', retryAfterMs: parseRetryAfterMs(res.retryAfter, now) };
     }
-    if (!res.ok)
+    if (res.status < 200 || res.status >= 300)
         return { kind: 'error' };
-    const body = await res.text().catch(() => '');
-    const windows = parseUsageResponse(body);
+    const windows = parseUsageResponse(res.body);
     return windows ? { kind: 'ok', windows } : { kind: 'error' };
 }
 async function main() {

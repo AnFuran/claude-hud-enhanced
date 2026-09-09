@@ -29,5 +29,11 @@ export declare function successSnapshot(windows: UsageWindows, now: number): Usa
  * that failed is not a read, and must not be recorded as one.
  */
 export declare function failureSnapshot(prev: UsageSnapshot | null, status: Exclude<UsageSnapshot['status'], 'ok'>, now: number, retryAfterMs?: number | null): UsageSnapshot;
+/**
+ * Proxy to tunnel the usage call through: HTTPS_PROXY > https_proxy > HTTP_PROXY
+ * > http_proxy, else DEFAULT_PROXY_URL. Null means "connect directly" — the host
+ * is covered by NO_PROXY, or the configured value is not an http(s) URL.
+ */
+export declare function resolveProxyUrl(host: string, env?: NodeJS.ProcessEnv): URL | null;
 export {};
 //# sourceMappingURL=refresh-usage.d.ts.map

@@ -8,6 +8,7 @@ import {
   successSnapshot,
   failureSnapshot,
   keychainServiceForConfigDir,
+  resolveProxyUrl,
 } from '../dist/refresh-usage.js';
 import { USAGE_TTL_MS, BACKOFF_RATE_LIMIT_MS } from '../dist/usage-hybrid.js';
 
@@ -188,4 +189,22 @@ test('failureSnapshot preserves the LIVE-read clock (a failed poll is not a read
 
 test('failureSnapshot with no previous snapshot leaves the LIVE clock unset', () => {
   assert.equal(failureSnapshot(null, 'error', NOW).oauth_updated_at, null);
+});
+
+// --- resolveProxyUrl ---
+
+test('resolveProxyUrl: falls back to the local proxy when no env proxy is set', () => {
+  assert.equal(resolveProxyUrl('api.anthropic.com', {})?.href, 'http://127.0.0.1:7890/');
+  assert.equal(resolveProxyUrl('api.anthropic.com', { HTTPS_PROXY: '   ' })?.href, 'http://127.0.0.1:7890/');
+});
+
+test('resolveProxyUrl: HTTPS_PROXY outranks HTTP_PROXY; NO_PROXY and bad values go direct', () => {
+  const env = { HTTPS_PROXY: 'http://10.0.0.1:8080', HTTP_PROXY: 'http://10.0.0.2:8080' };
+  assert.equal(resolveProxyUrl('api.anthropic.com', env)?.href, 'http://10.0.0.1:8080/');
+  assert.equal(resolveProxyUrl('api.anthropic.com', { HTTP_PROXY: 'http://10.0.0.2:8080' })?.href, 'http://10.0.0.2:8080/');
+  assert.equal(resolveProxyUrl('api.anthropic.com', { ...env, NO_PROXY: 'localhost,.anthropic.com' }), null);
+  assert.equal(resolveProxyUrl('api.anthropic.com', { ...env, no_proxy: '*' }), null);
+  assert.equal(resolveProxyUrl('api.anthropic.com', { ...env, NO_PROXY: 'localhost,127.0.0.1' })?.href, 'http://10.0.0.1:8080/');
+  assert.equal(resolveProxyUrl('api.anthropic.com', { HTTPS_PROXY: 'not a url' }), null);
+  assert.equal(resolveProxyUrl('api.anthropic.com', { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }), null);
 });
